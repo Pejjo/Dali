@@ -95,12 +95,23 @@
 #define TDMODE_DATA     2   //Send byte data
 
 #define TIMEOUT_TICKS   2450 // ~2.45mS
-#define WIDTHMIN_TICKS  333  // ~960 baud
-#define WIDTHMAX_TICKS  500 // ~1440 baud
+#define WIDTHMIN_TICKS  300  // ~960 baud
+#define WIDTHMAX_TICKS  550 // ~1440 baud
+#define RXSAMPLE_TICKS  624 // 3/4 bit @ 1200 baud
 #define TXWIDTH_TICKS   417 // ~1200 baud
 
 #define MAX_FLEN        4   // Maximum frame length excpected. Absolute max is 16 (8 bit bitpos counter)
 
+#define UART_RXDONE     1
+
+
+// Command:
+// Data is sent over 9-bit UART @ 38400 Baud.
+// First byte with bit 9 set is length bit,[1xxxPxLLL] P = Dali Power, LLL=Length 0-4
+// After length byte 0-4 bytes data follows [0DDDDDDDD]
+// A byte with length 0 will be responded with Dali Power status if bit P is set.
+// Othwerwise, 0 length frames are discarded.
+// All length bytes of a response of lager size than 0 will always have bit P set if line has power. 
 
 //--------------------------------
 // Functions Declarations
@@ -110,9 +121,10 @@ void UART2_Init(void);
 void UART1_Write(uint8_t);
 
 void dali_InitRx(void);
-void dali_StartTx(uint8_t *txPtr, uint8_t txLen);
+void dali_StartTx(uint8_t txLen);
 uint8_t dali_power(void);
-void sendStr(uint8_t *data, uint8_t len);
+
+void startUartTx(uint8_t len);
 volatile uint8_t Data = 0; // The Data Byte
 
 // Globals
@@ -127,17 +139,27 @@ volatile uint8_t transmitMode=TXMODE_IDLE;
 volatile uint8_t txPos=0;
 volatile uint8_t endPos=0;
 
+volatile uint8_t uartStat=0;
+
 uint8_t txBuffer[MAX_FLEN];
 uint8_t txLength;
 
-
 uint8_t rxBuffer[MAX_FLEN];
-uint8_t rxLength;
+volatile uint8_t rxLength;
+
+uint8_t txUartBuf[MAX_FLEN + 1];
+uint8_t txUartLen;
+volatile uint8_t* txUartPtr;
+
+uint8_t rxUartBuf[MAX_FLEN];
+volatile uint8_t rxUartLen;
+
 
 //--------------------------------
 // Main Routine
 void main(void)
 {
+    uint8_t transmitting=0;
     OSCCON=(OSCCON & 0x8F) | (0b110 << 4);   
   
 
@@ -145,8 +167,6 @@ void main(void)
   periodic_Init();
   UART1_Init(); // Initialize The UART in Master Mode @ 38400bps
   dali_InitRx();
-//  UART2_Init(); // Initialize The UART in Master Mode @ 38400bps
-//  analog_Init();
   //---------------------------
 
 //    TRISC2 = 0; // LED
@@ -156,65 +176,71 @@ void main(void)
 //    LATC2=1; 
 //    LATC3=0; 
 //    LATC5=1;
-  sendStr("Boot",4);
   while(1)
   { 
     CLRWDT();
-    if (tick==100)
+    TRISC3 = 0; // Debug pin
+    
+    if (uartStat & UART_RXDONE)
     {
-        statusLed=1;
-        if (dali_power())
+         LATC3 = 1;
+        if (rxUartLen==0)
         {
-            UART1_Write('1');
-            tick=0;
-//            LATC3 = 1;
+            // Command
+            if (rxUartBuf[0] == 0x10)
+            {
+                
+                // Read power status
+                if (dali_power())
+                {
+                    txUartBuf[0]=0x10;
+                }
+                else
+                {
+                    txUartBuf[0]=0x00;
+                }
+                startUartTx(1);
+            }
         }
-        else
+        else if (rxUartLen<=4)
         {
-            UART1_Write('0');
-            tick=0;
-            txBuffer[0]=0x53;
-            txBuffer[1]=0x46;
-            txBuffer[2]=0xF1;
-            txBuffer[3]=0x3C;
-            dali_StartTx(txBuffer,2);
-            UART1_Write('T');
-//            LATC3 = 0;
+            LATC3 = 0;//~LATC3;  // Debug pin
+            for (uint8_t fcc=0; fcc < rxUartLen; fcc++)
+            {
+                txBuffer[fcc]=rxUartBuf[fcc];
+            }
+            dali_StartTx(rxUartLen);
+            transmitting=1;
         }
-        
+        uartStat &= ~UART_RXDONE;
+    }
+    
+    // Restart reciever after transmission
+    if (transmitting && (transmitMode == TXMODE_IDLE)) //IDLE?
+    {
+         dali_InitRx();
+         transmitting=0;
+    }
+    if (captureMode==CAPMODE_DONE)
+    {
+        if (rxLength>0) // RxLenght cant be > MAX_FLEN 
+        {
+            txUartBuf[0]=rxLength;
+            if (dali_power())
+            {
+                txUartBuf[0] |=0x10;
+            }
+            for (uint8_t fcc=0; fcc < rxLength; fcc++)
+            {
+                txUartBuf[fcc+1]=rxBuffer[fcc];
+            }
+            startUartTx(rxLength + 1);
+        }
+        dali_InitRx();
+    }
 
-         
-    }
-    if (Data==0x30)
-    {
-//        txBuffer[0]=0xA5;
-//        dali_StartTx(txBuffer,1);
-//        UART1_Write('T');
-//        Data=0;
-    }
-   if ((captureMode==CAPMODE_DONE) && (transmitMode == TXMODE_IDLE)) 
-   {
-       
-       UART1_Write('C');
-       UART1_Write(rxLength+0x30);
-       UART1_Write(rxBuffer[0]);
-       UART1_Write(rxBuffer[1]);
-       UART1_Write(rxBuffer[2]);
-       UART1_Write(rxBuffer[3]);       
-       UART1_Write(';');
-       dali_InitRx();
-   }
-//    PORTC = 0x24;
-    // Stay Idle, Everything is handled in the ISR !
   }
-  return;
-  //---------------------------
-  while(1)
-  {
-      __delay_ms(250);
-      UART1_Write(Data);
-      __delay_ms(250);
-  }
+ 
   return;
 }
 //--------------------------------
@@ -230,7 +256,7 @@ void periodic_Init(void)
 
 void UART1_Init(void)
 {
-
+    ANSELCbits.ANSC7=0;
     // Set The RX-TX Pins to be in UART mode (not io)
     TRISC6 = 1; // As stated in the datasheet
     TRISC7 = 1; // As stated in the datasheet
@@ -241,7 +267,7 @@ void UART1_Init(void)
     // Enable The Ascynchronous Serial Port
     SYNC1 = 0;
     SPEN1 = 1;
-
+    RX91 = 1; // Enable 9 bit
     //--[ Enable UART Receiving Interrupts ]--
     RC1IE = 1; // UART Receving Interrupt Enable Bit
     PEIE = 1; // Peripherals Interrupt Enable Bit
@@ -249,9 +275,9 @@ void UART1_Init(void)
     //------------------
     CREN1 = 1; // Enable Data Continous Reception
 
-    TXEN1 = 1; // Enable UART Transmission
+   
 }
- 
+
 void __interrupt(low_priority) ISR(void)
 { 
     static uint16_t lastEdge;
@@ -261,38 +287,102 @@ void __interrupt(low_priority) ISR(void)
     uint8_t thisLvl;
     static uint8_t dataByte;
     static uint8_t *dataPtr;
+    
+    static uint8_t rxUartPos;
     if (RC1IF == 1)
     {
-//        uint8_t UART1_Buffer;
-        Data = RC1REG; // Read The Received Data Buffer
-        RC1IF = 0; // Clear The Flag
-//        UART2_Write(UART1_Buffer);
+        uint8_t status, data;
+        status=RCSTA1;
+        data=RCREG1;
+        RC1IF = 0; // Not needed
+        //LATC3 = ~LATC3;  // Debug pin
+        if (status & 0x01) // 9-bit set
+        {
+            //LATC3 = ~LATC3;  // Debug pin
+            rxUartLen=data;
+            rxUartPos = 0;
+            if (rxUartLen>5)
+            {   // We got a command, store data in pos 0.
+                rxUartBuf[0] = rxUartLen;
+                rxUartLen=0;
+            }
+        }
+        else if (rxUartPos < rxUartLen)
+        {
+            rxUartBuf[rxUartPos++] = data;
+        }
+        
+        if (rxUartPos == rxUartLen)
+        {   
+            uartStat|=UART_RXDONE;
+            //LATC3 = ~LATC3;  // Debug pin
+        }
+        
+    }
+    
+    if (TX1IF == 1)
+    {
+        TX1IF=0;
+        if (txUartLen>0)
+        {
+            txUartLen--;
+            txUartPtr++;
+            TX9D1=0;
+            TXREG1=*txUartPtr;
+            TX1IE=1;
+        }
+        else
+        {
+            TX1IE=0;
+        }
     }
     if ((CCP4IF == 1) && (CCP4IE == 1))
     {
         CCP4IF = 0;
-        
+//             LATC3=~LATC3;    
+       
         if (captureMode==CAPMODE_INIT)
         {   // First rising edge, sync bit.
             lastEdge=CCPR4;
+            LATC3=0;  // Debug pin
             captureMode=CAPMODE_SYNC;
             CCP4CON  = 0x04; // Find falling edge
+
+            rxLength=0;     // Init buffer and length
+            dataPtr=rxBuffer;
+                
             CCPR5=lastEdge + TIMEOUT_TICKS;
+            CCP5IF = 0; // Clear timeout
             CCP5IE = 1; // Enable timeout
-            //LATC3=1;  // Debug pin
-            
+                    
         }
         else if (captureMode==CAPMODE_SYNC)
-        {
+        { // First falling edge. We now can check bit width
+            
             width=CCPR4-lastEdge;
+
             if (( width > WIDTHMIN_TICKS ) && ( width < WIDTHMAX_TICKS))
             {
                 captureMode=CAPMODE_SAMPL;
-                CCPR1 = CCPR4 + (width >> 1); // Add half width delay on fist sample
-                CCP1IE = 1; // Start sample clock
-                CCP4IE = 0; // Stop edge
-                bitPos = 0;
-                //LATC3=0;  // Debug pin
+//                LATC3=1;  // Debug pin
+                CCP4CON  = 0x05; // Find rising edge
+                bitPos = 0; // Reset bit counter
+
+                CCPR1 = CCPR4 + RXSAMPLE_TICKS; // Set sample timer to 3/4 bits
+                CCP1CON = 0x0A; // Enable sample interrupt
+                CCP1IF = 0; // Important, clear flag for sample timer
+                CCP1IE = 1; // Start sample clock          
+                
+                if ((PORTB & 0x01) != 0x00)
+                {   // Check start bit
+                    // Invaid level
+                    captureMode=CAPMODE_INIT;
+                    CCP4CON  = 0x05; // Start with rising edge
+                    CCP1IE = 0; // Disable sample timer
+                    CCP4IE = 1; // Enable edge
+                    CCP5IE = 0; // Disable timeout
+                }                
+      
             }
             else
             {
@@ -305,75 +395,70 @@ void __interrupt(low_priority) ISR(void)
             }
                  
         }
+        else if (captureMode==CAPMODE_SAMPL)
+        {
+            // Edge is changed in sample interrupt so that we dont trigger on bit egdes, just the mid transition
+//            LATC3=~LATC3;    
+            if (CCP1IE==0) { // If we sampled previous point
+                CCPR1 = CCPR4 + RXSAMPLE_TICKS; // Move sample timer ahead 3/4 bit
+                CCP1CON = 0x0A;
+                CCP1IF = 0; // Important, clear flag for sample timer
+                CCP1IE = 1; // Start sample clock  
+            }                
+        }
     }
     if ((CCP1IF == 1) && (CCP1IE == 1))
-    {
+    {   // Sample timer expired. Sample bit and change polarity of edge interrupt
+        CCP1IE = 0;
         // Sample interrupt
+           if (PORTB & 0x01) 
+            {
+                // High level, next edge will be falling
+                CCP4CON  = 0x04;
+            }
+            else
+            {
+                // Low level, next edge will be rising
+                CCP4CON  = 0x05;
+            }
+
+        LATC3=~LATC3; 
         CCP1IF = 0;
         if (captureMode == CAPMODE_SAMPL)
         {
-            //LATC3=~LATC3; // Toggle debug pin
-            CCPR1 = CCPR1 + width; // Move ahead to next sample point
-            CCPR5= CCPR4 + TIMEOUT_TICKS; // Mode timeout ahead
+            CCPR5= CCPR1 + TIMEOUT_TICKS; // Mode timeout ahead
             
-            thisLvl=(PORTB & 0x01);
-            
-            if (bitPos == 0) // First transition after start half-bit,
+            dataByte = (dataByte << 1) & 0xFF;
+            dataByte |= (PORTB & 0x01); 
+            if ((bitPos & 0x07) == 0x07) // Every byte;
             {
-                if (thisLvl != 0x00)
+                // LATC3=~LATC3;
+                if (rxLength < MAX_FLEN)
                 {
-                    // Invaid level
-                    captureMode=CAPMODE_INIT;
-                    CCP4CON  = 0x05; // Start with rising edge
-                    CCP1IE = 0; // Disable sample timer
-                    CCP4IE = 1; // Enable edge
-                    CCP5IE = 0; // Disable timeout
+                    *dataPtr = dataByte;
+                    rxLength ++;
+                    dataPtr ++;
+                      
                 }
-                else
-                {
-                    dataByte=0;
-                    dataPtr=rxBuffer;
-                    rxLength=0;
-                }
-            }
-            else if ((bitPos & 0x01) == 0) // Data every even bitpos (two tansitions/bit)
-            {
-                if ((lastLvl == 0) && (thisLvl == 1))
-                {
-                    dataByte = (dataByte << 1) & 0xFF;
-                    //dataByte |= 0x00; Not needed to waste a cycle                     
-                }
-                else if ((lastLvl == 1) && (thisLvl ==0))
-                {
-                    dataByte = (dataByte << 1) & 0xFF;
-                    dataByte |= 0x01; 
-                }
-                else 
-                {
-                    captureMode=CAPMODE_DONE; 
-                    // Stopp after two 00 or 11.
-                }
-                if ((bitPos & 0x0F) == 0) // Every byte;
-                {
-                    if (rxLength < MAX_FLEN)
-                    {
-                        *dataPtr = dataByte;
-                        rxLength ++;
-                        dataPtr ++;
-                    }
-                    dataByte=0;
-                }
+                dataByte=0;
             }
             bitPos++;
-            lastLvl=thisLvl;
+//            LATC3=~LATC3;
         }
     }
     if ((CCP5IF == 1) && (CCP5IE == 1))
     {
         // Timeout Interrupt
         CCP5IF = 0; // Clear flag
-        //LATC3=0;  // Debug pin
-        captureMode=CAPMODE_INIT;
+        LATC3=0;  // Debug pin
+        if ((bitPos>8)&&((bitPos % 8)==1)) // It was a stopbit, all data (probebly) received
+        {
+            captureMode=CAPMODE_DONE;
+        }
+        else
+        {
+            captureMode=CAPMODE_INIT;
+        }
         CCP4CON  = 0x05; // Start with rising edge
         CCP1IE = 0; // Disable sample timer
         CCP4IE = 1; // Enable edge
@@ -407,7 +492,7 @@ void __interrupt(low_priority) ISR(void)
             transmitMode=TXMODE_IDLE;
             CCP2CON = 0x00; // Release pin
             LATB3  = 1; // Output off
-            LATC3 = 0;  // Debug pin
+//            LATC3 = 0;  // Debug pin
             CCP2IE = 0;
         }        
         else if ((txPos & 0x01) == 0) // We are in the middle of a bit.
@@ -418,7 +503,7 @@ void __interrupt(low_priority) ISR(void)
                 dataPtr++;
                 dataByte=*dataPtr;
                 txLength--;
-                LATC3 = ~LATC3;  // Debug pin
+                
             }
             else
             {
@@ -468,17 +553,20 @@ void __interrupt(low_priority) ISR(void)
 
         txPos++;
     }
+ 
     if (TMR2IF == 1)
     {
         tick++;
         TMR2IF = 0; // Clear The Flag
     }
-}
+
+ }
 
 void dali_InitRx(void)
 {
     while (transmitMode!=TXMODE_IDLE); // Wait for any ongoing transmissions to end 
     captureMode=CAPMODE_INIT;
+    rxLength=0;
     TRISC3 = 0; // Debug pin out
     TRISB0 = 1; // Input capture........
     LATB3  = 1; // Output off
@@ -497,7 +585,7 @@ void dali_InitRx(void)
     CCP5IE = 0; // Disable timeout
 }
 
-void dali_StartTx(uint8_t *txPtr, uint8_t txLen)
+void dali_StartTx(uint8_t txLen)
 {
     while ((captureMode!=CAPMODE_INIT) && (captureMode!=CAPMODE_DONE)); // Wait for any ongoing reception to complete
     transmitMode=TXMODE_SYNC;
@@ -506,7 +594,7 @@ void dali_StartTx(uint8_t *txPtr, uint8_t txLen)
     txLength = txLen;
     CCP2CON = 0x08; // Set output on match
     CCPR2 = TMR1 + TXWIDTH_TICKS;
-    LATC3 = 1;  // Debug pin
+//    LATC3 = 1;  // Debug pin
     LATB3  = 0; // Output on
     CCP1IE = 0; // Disable sample timer
     CCP2IE = 1; // Enable transmitter
@@ -516,7 +604,7 @@ void dali_StartTx(uint8_t *txPtr, uint8_t txLen)
 
 uint8_t dali_power(void)
 {
-    return (((PORTB & (1<<5)) == (1<<5)));
+    return (((PORTB & (1<<5)) == 0));
 }
 
 
@@ -528,8 +616,17 @@ void UART1_Write(uint8_t data)
   TXREG1 = data;
 }
 
-void sendStr(uint8_t *data, uint8_t len)
+void startUartTx(uint8_t len)
 {
-    while(--len)
-        UART1_Write(*(data++));
+    while (TRMT1 == 0); // Ongoing transmission
+    if (len > 0)
+    {
+        txUartLen = len - 1;
+        txUartPtr = txUartBuf;
+        TX91=1;
+        TXEN1=1;
+        TX9D1=1;
+        TXREG1=*txUartPtr;
+        TX1IE=1;
+    }
 }

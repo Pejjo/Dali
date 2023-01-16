@@ -85,6 +85,26 @@
 #define PT1  AN0
 #define PT2  AN16
 
+#define RXTIMEOUT   520 // 2*byte-time for 38400
+#define RS485DONE   0x01
+
+#define UART_RXDONE     1
+#define MAX_FLEN        4   // Maximum frame length excpected by Dali controller
+
+// RS485 protocol:
+// All data are transparently sent out after 2*byte-time timeout.
+// If only a single 0x00 is received, bus power status (0x10=power, 0x00=un-powered) is returned
+
+
+// Inpter processor protocol
+// Command:
+// Data is sent over 9-bit UART @ 38400 Baud.
+// First byte with bit 9 set is length bit,[1xxxPxLLL] P = Dali Power, LLL=Length 0-4
+// After length byte 0-4 bytes data follows [0DDDDDDDD]
+// A byte with length 0 will be responded with Dali Power status if bit P is set.
+// Othwerwise, 0 length frames are discarded.
+// All length bytes of a response of lager size than 0 will always have bit P set if line has power. 
+
 
 //--------------------------------
 // Functions Declarations
@@ -97,12 +117,26 @@ void analog_Init(void);
 uint8_t analog_Done(void);
 void analog_Start(uint8_t ch);
 uint8_t analog_Get(void);
+void startUartTx(uint8_t len);
+
 
 
 uint8_t UART_Read(void);
 // Globals
 uint8_t statusLed = 0;
 volatile uint8_t tick=0;
+
+uint8_t txUartBuf[MAX_FLEN + 1];
+uint8_t txUartLen;
+volatile uint8_t* txUartPtr;
+
+uint8_t rxUartBuf[MAX_FLEN];
+volatile uint8_t rxUartLen;
+volatile uint8_t uartStat=0;
+
+volatile uint8_t UART2_Buffer[MAX_FLEN];
+volatile uint8_t rs485Stat=0;
+volatile uint8_t rs485Len=0;
 //--------------------------------
 // Main Routine
 void main(void)
@@ -134,7 +168,7 @@ void main(void)
         {
             uint8_t adv=analog_Get();
             analog_Start(16);
-            UART2_Write(adv);
+//          Do something with analog value
             tick=0;
         }
          
@@ -146,6 +180,43 @@ void main(void)
         LATB3=0;
         CREN2 = 1; // Reenable Data Continous Reception
       }
+    // Got host data
+    if (rs485Stat & RS485DONE)
+    {
+    if ( (rs485Len==1) && (UART2_Buffer[0]==0x00) )
+    {
+        txUartBuf[0]=0x10;
+        startUartTx(1);
+    }
+    else if (rs485Len>=1)
+    {
+        txUartBuf[0]=rs485Len;
+        for (uint8_t fcc=0; fcc <= rs485Len; fcc++)
+        {
+            txUartBuf[fcc+1]=UART2_Buffer[fcc];
+        }    
+        startUartTx(rs485Len+1);
+    }
+    rs485Stat=0;
+    rs485Len=0;
+    }
+    // Got data from FB-processor
+    if (uartStat & UART_RXDONE)
+    {
+        if (rxUartLen==0)
+        {
+            UART2_Write(rxUartBuf[0]);
+            // Command
+        }
+        else // Length is 1-4 bytes
+        {
+            for (uint8_t fcc=0; fcc < rxUartLen; fcc++)
+            {
+                UART2_Write(rxUartBuf[fcc]);
+            }
+        }
+        uartStat &= ~UART_RXDONE;
+    }    
 //    PORTC = 0x24;
     // Stay Idle, Everything is handled in the ISR !
   }
@@ -172,8 +243,7 @@ void periodic_Init(void)
 
 void UART1_Init(void)
 {
-
-    // Set The RX-TX Pins to be in UART mode (not io)
+ // Set The RX-TX Pins to be in UART mode (not io)
     TRISC6 = 1; // As stated in the datasheet
     TRISC7 = 1; // As stated in the datasheet
     BRGH1 = 1; // Set For High-Speed Baud Rate
@@ -191,7 +261,7 @@ void UART1_Init(void)
     //------------------
     CREN1 = 1; // Enable Data Continous Reception
 
-    TXEN1 = 1; // Enable UART Transmission
+    RX91 = 1; // Enable 9 bit
 }
  
 void UART2_Init(void)
@@ -218,24 +288,84 @@ void UART2_Init(void)
     CREN2 = 1; // Enable Data Continous Reception
 
     TXEN2 = 1; // Enable UART Transmission
+    
+    T1CON = 0x13; // Fosc/4/1=1M, enabled and 16 bit
+    CCP1CON = 0x0A;  //Interrupt on timeout
+    CCPTMRS0 = 0x00; // CCP1 -> Timer1, CCP2 -> Timer1
+    CCP1IE = 0; // Disable byte timer
 }
 
 void __interrupt(low_priority) ISR(void)
 { 
+    static uint8_t rxUartPos;
+    static uint8_t rs485Pos;
     if (RC1IF == 1)
     {
-        uint8_t UART1_Buffer;
-        UART1_Buffer = RC1REG; // Read The Received Data Buffer
         RC1IF = 0; // Clear The Flag
-        UART2_Write(UART1_Buffer);
+        if (RX9D1) // 9-bit set
+        {
+            uint8_t rxb;
+            rxb=RC1REG;
+            rxUartLen=rxb & 0x0F; 
+            rxUartPos = 0;
+            if (rxUartLen==0) //Only allowed frame lengtgs are 0,1,2,3 or 4. If we have 0 bytes payload, status are put in data[0]]
+            {   // We got a command, store data in pos 0.
+                rxUartBuf[0] = rxb;
+            }
+        }
+        else if (rxUartPos < rxUartLen)
+        {
+            rxUartBuf[rxUartPos++] = RC1REG;
+        }
+        
+        if (rxUartPos == rxUartLen) // Flag if this was last byte expected.
+        {
+            uartStat|=UART_RXDONE;
+        }
+    }
+    
+    if (TX1IF == 1)
+    {
+        TX1IF=0;
+        if (txUartLen>0)
+        {
+            txUartLen--;
+            txUartPtr++;
+            TX9D1=0;
+            TXREG1=*txUartPtr;
+            TX1IE=1;
+        }
+        else
+        {
+            TX1IE=0;
+        }
     }
     if (RC2IF == 1)
     {
-        uint8_t UART2_Buffer;
-        UART2_Buffer = RC2REG; // Read The Received Data Buffer
+        //uint8_t UART2_Buffer;
+        if (rs485Pos<MAX_FLEN)
+        {
+            UART2_Buffer[rs485Pos++] = RC2REG; // Read The Received Data Buffer
+        }
+        else
+        {
+            uint8_t tmp;
+            tmp=RC2REG; // Discard
+        }
         RC2IF = 0; // Clear The Flag
-        UART1_Write(UART2_Buffer);
         LATC3 = 1; // Flash green
+        CCPR1= TMR1 + RXTIMEOUT; // Move RX-timeout ahead 2 byte times
+        CCP1IF = 0; // Clear timeout
+        CCP1IE = 1; // Enable timeout
+    }
+    if ((CCP1IF == 1) && (CCP1IE == 1))
+    {   
+        // Signal that we got a frame after the byte timeout.
+        CCP1IF = 0; // Clear timeout
+        CCP1IE = 0; // Enable timeout
+        rs485Stat|=RS485DONE;
+        rs485Len=rs485Pos;
+        rs485Pos=0;
     }
     if (TMR2IF == 1)
     {
@@ -293,3 +423,17 @@ void UART2_Write(uint8_t data)
     TXREG2 = data;
 }
 
+void startUartTx(uint8_t len)
+{
+    while (TRMT1 == 0); // Ongoing transmission
+    if (len > 0)
+    {
+        txUartLen = len - 1;
+        txUartPtr = txUartBuf;
+        TX91=1;
+        TXEN1=1;
+        TX9D1=1;
+        TXREG1=*txUartPtr;
+        TX1IE=1;
+    }
+}
